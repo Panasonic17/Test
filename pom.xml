@@ -15,12 +15,7 @@
 
     <dependencies>
         <!-- https://mvnrepository.com/artifact/org.sonarsource.java/sonar-java-plugin -->
-        <dependency>
-            <groupId>org.sonarsource.java</groupId>
-            <artifactId>sonar-java-plugin</artifactId>
-            <version>4.2</version>
 
-        </dependency>
 
         <dependency>
             <groupId>junit</groupId>
