@@ -1,5 +1,5 @@
-projectKey=nowTEST:nowTEST
+projectKey=org.sonarqube:parent
 serverUrl=http://localhost:9000
-dashboardUrl=http://localhost:9000/dashboard/index/nowTEST:nowTEST
-ceTaskId=AWHHAGXPpjoOSPT2Jg9i
-ceTaskUrl=http://localhost:9000/api/ce/task?id=AWHHAGXPpjoOSPT2Jg9i
+dashboardUrl=http://localhost:9000/dashboard/index/org.sonarqube:parent
+ceTaskId=AWHHGZz5pjoOSPT2Jg9l
+ceTaskUrl=http://localhost:9000/api/ce/task?id=AWHHGZz5pjoOSPT2Jg9l
