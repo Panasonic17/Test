@@ -10,7 +10,7 @@
 
     <name>Example of SonarQube Scanner for Maven + Code Coverage by UT and IT</name>
 
-   
+
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
