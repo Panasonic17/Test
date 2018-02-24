@@ -6,10 +6,6 @@ import java.lang.reflect.Constructor;
 public class main {
     public static void main(String[] args) throws InterruptedException {
 
-            Integer i=new Integer(2);
-            Class c=i.getClass();
-        Class c1=i.getClass();
-
 
     }
 }
