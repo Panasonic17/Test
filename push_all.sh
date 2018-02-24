@@ -1,4 +1,4 @@
 git add .
 massage="$(date)"
 git commit -m "$massage"
-git push origin master
+git push origin1 master
