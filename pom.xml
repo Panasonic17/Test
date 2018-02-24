@@ -26,7 +26,6 @@
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>4.12</version>
-            <scope>testTest</scope>
         </dependency>
     </dependencies>
     <build>
@@ -41,13 +40,6 @@
             </plugins>
         </pluginManagement>
         <!-- To use the plugin goals in your POM or parent POM -->
-        <plugins>
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>sonar-maven-plugin</artifactId>
-                <version>4.5.7</version>
-            </plugin>
-        </plugins>
     </build>
      <profiles>
     <profile>
