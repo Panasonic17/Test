@@ -1,0 +1,265 @@
+#!/usr/bin/env groovy
+/**
+    * Jenkins Multibranch Pipeline for Activity Engine
+    * Every commit in every branch will be built and tested
+    * Commits from develop branch will be built, tested, dockerized and deployed to dev environment
+    * 
+
+*/
+
+// pipeline config
+def javaAgentLabel = 'build&&java'
+def dockerAgentLabel = 'docker'
+
+// project config
+def projectName = "activitiengine-integration"
+def commit
+// WARNING: ordering is strict, because used for build promotion
+def promotionEnvironments = ['gdev','sit','uat','prod']
+
+// git config
+def gitCredentials = 'svc_sysexc_cd_git'
+
+// docker config
+def dockerCredentials = 'svc_icinga'
+def dockerRepo = 'tools.adidas-group.com:5000'
+def imagePrefix = 'app/mp'
+def deployCredentials = 'piwik-machine-pk'
+def vmUser = "hlp_gonzajua1@emea.adsint.biz"
+def vmServer = "deheremap7499.emea.adsint.biz"
+
+// slack config
+def slackCredentials = 'mp-slack-token'
+def slackTeam = 'adidas-on-slack'
+def slackChannel
+
+@Library('jenkins-gsd-config-tools@develop') _
+
+pipeline {
+
+    agent { label dockerAgentLabel }
+
+    parameters {
+        choice(name: 'ENV', description: 'Environment to be used', choices: 'gdev\nsit\nuat\nprod')
+        choice(name: 'ACTION', description: 'Action to be performed', choices: 'dockerize_and_deploy\npromote\ndeploy\ndockerize_release')
+    }
+
+    stages {
+
+        stage('Init') {
+            agent { label javaAgentLabel }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    environment = params.ENV
+                    action = params.ACTION
+                    commit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    envVariables = "-e profile=${environment}"
+
+                    switch(params.ENV) {
+                        case 'gdev':
+                           portConfig = '-p 8090:8080'
+                            slackChannel = 'se-dev-deployments'
+                        break
+                        case 'sit':
+                            portConfig = '-p 8091:8080'
+                            slackChannel = 'se-sit-deployments'
+                        break
+                        case 'uat':
+                            portConfig = '-p 8092:8080'
+                            slackChannel = 'se-uat-deployments'
+                        break
+                        case 'prod':
+                            portConfig = '-p 8092:8080'
+                            slackChannel = 'se-pro-deployments'
+                        break
+                        default:
+                            echo "Incorrect environment: ${environment}. Aborting current deploy..."
+                            currentBuild.result = 'ABORTED'
+                            error "Deploy aborted due to incorrect environment parameter: ${environment}"
+                        break
+                    }// switch
+                    echo """Deployment details
+                    branch: ${env.BRANCH_NAME}
+                    commit: ${commit}
+                    environment: ${environment}
+                    action: ${action}
+                    """
+                }// script
+            }// steps
+            post { 
+                success {
+                    script { bitbucket.notify message: 'Collect info', commit: commit, status: 'progress', credentials: gitCredentials }
+                }// success
+                failure {
+                    script { bitbucket.notify commit: commit, status: 'error', credentials: gitCredentials }
+                }// failure
+            }// post
+        }// stage
+
+        stage('Build') {
+            when {
+                anyOf {
+                    allOf {
+                        expression { action == 'dockerize_and_deploy' }
+                        expression { environment == 'gdev' }
+                    }// allOf
+                    allOf {
+                        branch 'release'
+                        expression { action == 'dockerize_release' }
+                    }// allOf
+                }// anyOf
+            }// when
+            agent { label javaAgentLabel }
+            steps {
+                echo "Jenkins node name: ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        bitbucket.notify message: 'Build', commit: commit, status: 'progress', credentials: gitCredentials
+                        configFileProvider([configFile('00fab7d0-2961-4888-893a-14754568fb31')]) {
+                            withMaven(maven: 'maven-3.3.9') {
+                                sh 'mvn clean org.jacoco:jacoco-maven-plugin:prepare-agent test install'
+                            }// withMaven
+                        }// configFileProvider
+                        stash 'workspace'
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    script { bitbucket.notify message: 'Build', commit: commit, status: 'progress', credentials: gitCredentials }
+                }// success
+                failure {
+                    script { bitbucket.notify commit: commit, status: 'error', credentials: gitCredentials }
+                }// failure
+            }// post
+        }// stage
+
+        stage('Test') {
+            when {
+                anyOf {
+                    allOf {
+                        expression { action == 'dockerize_and_deploy' }
+                        expression { environment == 'gdev' }
+                    }// allOf
+                    allOf {
+                        branch 'release'
+                        expression { action == 'dockerize_release' }
+                    }// allOf
+                }// anyOf
+            }// when
+            steps {
+                echo "Jenkins node name: ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        bitbucket.notify message: 'Test', commit: commit, status: 'progress', credentials: gitCredentials
+                        unstash 'workspace'
+                        sonar.run version: '1.0', branch: env.BRANCH_NAME
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    script { bitbucket.notify message: 'Test', commit: commit, status: 'progress', credentials: gitCredentials }
+                }// success
+                failure {
+                    script { bitbucket.notify commit: commit, status: 'error', credentials: gitCredentials }
+                }// failure
+            }// post
+        }// stage
+
+        stage('Dockerize') {
+            when {
+                anyOf {
+                    allOf {
+                        branch 'develop'
+                        expression { action == 'dockerize_and_deploy' }
+                        expression { environment == 'gdev' }
+                    }// allOf
+                    allOf {
+                        branch 'release'
+                        expression { action == 'dockerize_release' }
+                    }// allOf
+                }// anyOf
+            }// when
+            steps {
+                echo "Jenkins node name: ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        bitbucket.notify message: 'Dockerize', commit: commit, status: 'progress', credentials: gitCredentials
+                        unstash 'workspace'
+                        dock.buildAndPush repo: dockerRepo, image: "${imagePrefix}/${projectName}:${environment}", credentials: dockerCredentials
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    script { bitbucket.notify message: 'Dockerize', commit: commit, status: 'progress', credentials: gitCredentials }
+                }// success
+                failure {
+                    script { bitbucket.notify commit: commit, status: 'error', credentials: gitCredentials }
+                }// failure
+            }// post
+        }// stage
+
+        stage('Deploy') {
+            when {
+                anyOf {
+                    allOf {
+                       branch 'develop'
+                        expression { action == 'dockerize_and_deploy' }
+                        expression { environment == 'gdev' }
+                    }// allOf
+                    expression { action == 'deploy' }
+                }// anyOf
+            }// when
+            steps {
+                echo "Jenkins node name: ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        bitbucket.notify message: 'Deploy', commit: commit, status: 'progress', credentials: gitCredentials
+                        dock.runContainerOnRemoteHost dockerCredentials: dockerCredentials, deployCredentials: deployCredentials, vmServer: vmServer, vmUser: vmUser, containerName: "${projectName}-${environment}", portConfig: portConfig, envVariables: envVariables, repo: dockerRepo, image: "${imagePrefix}/${projectName}:${environment}"
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    script { bitbucket.notify message: 'Deploy', commit: commit, status: 'progress', credentials: gitCredentials }
+                }// success
+                failure {
+                    script { bitbucket.notify commit: commit, status: 'error', credentials: gitCredentials }
+                }// failure
+            }// post
+        }// stage
+
+        stage('Promote') {
+            when { expression { action == 'promote' } }
+            steps {
+                echo "Jenkins node name: ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        currentEnvIndex = promotionEnvironments.indexOf(environment)
+                        if ( currentEnvIndex == 0 ) {
+                            echo "Cant promote to ${environment}. Aborting current deploy..."
+                            currentBuild.result = 'ABORTED'
+                            error 'Deploy aborted'
+                        }// if
+                        buildToPromote = promotionEnvironments[currentEnvIndex -1]
+                        echo "Promoting: ${buildToPromote} -> ${environment}"
+                        bitbucket.notify message: 'Promote', commit: commit, status: 'progress', credentials: gitCredentials
+                        dock.retagImageAndPush repo: dockerRepo, originalImage: "${imagePrefix}/${projectName}:${buildToPromote}", newImage: "${imagePrefix}/${projectName}:${environment}", credentials: dockerCredentials
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    script { bitbucket.notify message: 'Promote', commit: commit, status: 'progress', credentials: gitCredentials }
+                }// success
+                failure {
+                    script { bitbucket.notify commit: commit, status: 'error', credentials: gitCredentials }
+                }// failure
+            }// post
+        }// stage
+
+    }// stages
+}// pipeline

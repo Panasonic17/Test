@@ -1,0 +1,550 @@
+#!/usr/bin/env groovy
+/**
+        * Jenkins Pipeline for Flex PLM Apparel application deployment
+        * from https://tools.adidas-group.com/bitbucket/projects/FAP/repos/flex_plm_app_upgrade/browse
+        * Author: Kostiantyn.Skraga@externals.adidas-group.com
+*/
+
+def artifactoryUrl = 'http://deheremap6392:8082/artifactory'
+def artifactoryUploadPath = 'flex/app'
+def artifactoryCredentialsID = 'svc_Flex_CI'
+def sshOpts = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+def gitCredentialsID = 'pc-git-flex'
+def gitJenkinsBranch = 'jenkins-internal'
+def flexAppNamePrefix = 'FLEX_PLM_Apparel_'
+def flexAppProtocol = 'https'
+def flexAppLoadBalancer
+def flexMasterServer
+def tmVersionRequired
+def tmChangesRequired
+def tmChangesServer
+def tmChangesApplied
+def tmChangesConfirmed = false
+def tmpFolder
+
+// Set dummy default parameters. Per environment are below (Initialization stage)
+def envRequireDeployConfirmation = false
+def sshUsername = 'ssh_deployment_username_here'
+def sshServers = ['flex', 'servers', 'list', 'here']
+def sshCredentials = 'Jenkins_ID_of_flex_private_ssh_key_here'
+def flexAppCredentials = 'flex_app_username_and_password_here'
+
+pipeline {
+
+    agent none
+
+    parameters {
+        choice(name: 'ENV', description: 'Environment for installation', choices: '-\nMIGRATION\nTRAINING\nTEST\nSECURITY\nPRODUCTION')
+        string(name: 'PROMOTED_ID', description: 'Promoted Build ID', defaultValue: '')
+    }
+
+    options {
+        // How many builds to keep
+        buildDiscarder(logRotator(numToKeepStr:'200'))
+    }
+
+    stages {
+
+        stage('Initialization') {
+            steps {
+                script {
+                    // Set parameters per environment
+                    switch(params.ENV) {
+                        // PRODUCTION settings
+                        case 'PRODUCTION':
+                            envRequireDeployConfirmation = true
+                            sshUsername = 'aagadmin'
+                            // MASTER SERVER SHOULD BE FIRST IN THE LIST !!!
+                            sshServers = ['deheremap6622', 'deheremap6617','deheremap6618', 'deheremap6619',
+                                            'deheremap6620', 'deheremap6732', 'deheremap6733', 'deheremap6734',
+                                            'deheremap6735', 'deheremap6736', 'deheremap6737', 'deheremap6738',
+                                            'deheremap6739', 'deheremap6740', 'deheremap6741','deheremap6742',
+                                            'deheremap7236']
+                            sshCredentials = 'FLEX-Production'
+                            // Server for applying TypeManager chages (must be Slave and NOT Master or Queue type)
+                            tmChangesServer = 'deheremap6733'
+                            flexAppCredentials = 'FLEX-App-Production'
+                            flexAppLoadBalancer = 'aagplm.adidas-group.com'
+                            break
+                        // SECURITY also known as UAT settings
+                        case 'SECURITY':
+                            envRequireDeployConfirmation = true
+                            sshUsername = 'aagadmin'
+                            // MASTER SERVER SHOULD BE FIRST IN THE LIST !!!
+                            sshServers = ['deheremap6981', 'deheremap6982', 'deheremap6983']
+                            sshCredentials = 'FLEX-Security'
+                            // Server for applying TypeManager chages (must be Slave and NOT Master or Queue type)
+                            tmChangesServer = 'deheremap6982'
+                            flexAppCredentials = 'FLEX-App-Security'
+                            flexAppLoadBalancer = 'aagplmsecurity.adidas-group.com'
+                            break
+                        // TEST also known as SIT settings
+                        case 'TEST':
+                            envRequireDeployConfirmation = false
+                            sshUsername = 'aagadmin'
+                            // MASTER SERVER SHOULD BE FIRST IN THE LIST !!!
+                            sshServers = ['deheremap6675', 'deheremap6676', 'deheremap6677']
+                            sshCredentials = 'FLEX-Test'
+                            // Server for applying TypeManager chages (must be Slave and NOT Master or Queue type)
+                            tmChangesServer = 'deheremap6676'
+                            flexAppCredentials = 'FLEX-App-Test'
+                            flexAppLoadBalancer = 'aagplmtest.adidas-group.com'
+                            break
+                        // TRAINING settings
+                        case 'TRAINING':
+                            envRequireDeployConfirmation = false
+                            sshUsername = 'aagadmin'
+                            // MASTER SERVER SHOULD BE FIRST IN THE LIST !!!
+                            sshServers = ['deheremap6930', 'deheremap6931', 'deheremap6932']
+                            sshCredentials = 'FLEX-Training'
+                            // Server for applying TypeManager chages (must be Slave and NOT Master or Queue type)
+                            tmChangesServer = 'deheremap6931'
+                            flexAppCredentials = 'FLEX-App-Training'
+                            flexAppLoadBalancer = 'aagplmtraining.adidas-group.com'
+                            break
+                        // MIGRATION settings
+                        case 'MIGRATION':
+                            envRequireDeployConfirmation = false
+                            sshUsername = 'aagadmin'
+                            sshServers = ['deheremap7345']
+                            sshCredentials = 'FLEX-Migration'
+                            // Server for applying TypeManager chages (must be Slave and NOT Master or Queue type)
+                            tmChangesServer = 'deheremap7345'
+                            flexAppCredentials = 'FLEX-App-Migration'
+                            flexAppProtocol = 'http'
+                            flexAppLoadBalancer = 'aagplmmigration.adidas-group.com'
+                            break
+                        // UNKNOWN/INVALID environment parameter
+                        default:
+                            echo "Incorrect environment: ${params.ENV}. Aborting current deploy..."
+                            currentBuild.result = 'ABORTED'
+                            error "Deploy aborted due to incorrect environment parameter: ${params.ENV}"
+                            break
+                    }// switch
+
+                    flexMasterServer=sshServers[0]
+                    echo "Deploying application BUILD: ${env.PROMOTED_ID}"
+                    echo "Current environment: ${env.ENV}"
+                    echo "Username that will be used for deployment: ${sshUsername}"
+                    echo "Flex application protocol: ${flexAppProtocol}"
+                    echo "Flex servers: ${sshServers}"
+                    echo "Flex Master: ${flexMasterServer}"
+                    echo "Flex TypeManager: ${tmChangesServer}"
+
+                    // Deployment confirmation (10 minutes or cancel)
+                    if (envRequireDeployConfirmation == true) {
+                        timeout(10) {
+                            env.CONFIRMED = input message: "Deploy to ${params.ENV} confirmation", ok: "Yes, deploy to ${params.ENV}!",
+                                parameters: [choice(name: 'confirmation', choices: 'NO\nNO\nNO\nyes\nNO\nNO\n', description: "Are you sure about deploy to ${params.ENV}?")]
+                        }// timeout
+                        if (env.CONFIRMED != 'yes') {
+                            echo 'Aborting current deploy...'
+                            currentBuild.result = 'ABORTED'
+                            error 'Deploy aborted'
+                        }// if
+                    }// if
+                }// script
+            }// steps
+        }// stage
+
+        stage('Check SSH connectivity') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Starting SSH checks'
+                        sshagent (credentials: [sshCredentials]) {
+                            def nodes = [:]
+                            for (curSshServer in sshServers) {
+                                def sshServer = curSshServer
+                                nodes["Check ${sshServer}"] = {
+                                    echo "Running on Flex node: ${sshServer}"
+                                    sh "ssh ${sshOpts} -l ${sshUsername} ${sshServer} 'whoami; hostname; sudo -l'"
+                                }// nodes
+                            }// for
+                            parallel nodes
+                        }// sshagent
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    echo 'SSH connectivity check completed successfully'
+                    // deleteDir()
+                }// success
+                failure {
+                    error 'There was a failure during the SSH connectivity test'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Download and validate the App') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                echo "Downloading build: ${PROMOTED_ID} from Artifactory..."
+                withCredentials([usernameColonPassword(credentialsId: artifactoryCredentialsID, variable: 'CREDENTIALS')]) {
+                    retry(5) {
+                        sh "curl -s -f -u '${CREDENTIALS}' ${artifactoryUrl}/${artifactoryUploadPath}/${flexAppNamePrefix}${PROMOTED_ID}.jar -o ${WORKSPACE}/${flexAppNamePrefix}${PROMOTED_ID}.jar > /dev/null 2>&1"
+                    }// retry
+                }// withCredentials
+                echo "Validating application file: ${flexAppNamePrefix}${PROMOTED_ID}.jar"
+                sh "jar -tvf ${WORKSPACE}/${flexAppNamePrefix}${PROMOTED_ID}.jar > /dev/null 2>&1"
+            }// steps
+            post {
+                success {
+                    stash includes: "${flexAppNamePrefix}${PROMOTED_ID}.jar", name: 'application'
+                    deleteDir()
+                }// success
+                failure {
+                    error 'Download from Artifactory failed or application file is corrupted. Please check'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Check Type Manager changes') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Started TypeManager changes checks'
+                        // find required build job commit and TM changes version
+                        tmVersionRequired = sh (returnStdout: true, script: """awk -F, '\$2=="${PROMOTED_ID}"' ./build_dbversion.csv | cut -d, -f3""").trim()
+                        echo "Required TypeManager version: ${tmVersionRequired}"
+                        if ( tmVersionRequired != '' ) {
+                            def buildGitCommit = sh (returnStdout: true, script: """awk -F, '\$2=="${PROMOTED_ID}"' ./build_dbversion.csv | cut -d, -f6""").trim()
+                            echo "Build job git commit id: ${buildGitCommit}"
+                            sshagent (credentials: [gitCredentialsID]) {
+                                echo 'get migrations from git (commit from which the App was built) and stash them'
+                                sh "git checkout -f ${buildGitCommit} && git status"
+                                stash includes: "migrations/*.*", name: 'migrations'
+                                echo 'checkout jenkins internal branch with required scripts and unstash the changes'
+                                sh "git fetch && git checkout -f remotes/origin/${gitJenkinsBranch} && git status"
+                            }// sshagent
+                            unstash 'migrations'
+                            // run only on the Type Manager changes node ${tmChangesServer}
+                            sshagent (credentials: [sshCredentials]) {
+                                echo "Running on Flex TypeManager node: ${tmChangesServer}"
+                                tmpFolder = sh (returnStdout: true, script: """ssh -q ${sshOpts} -l ${sshUsername} ${tmChangesServer} mktemp -d -t tm_changes_${PROMOTED_ID}.XXXXX""").trim()
+                                echo "Created temp folder for changes: ${tmpFolder}"
+                                // transfer required files to temp folder
+                                sh "scp -C -r ${sshOpts} migrations schema_version.csv.${params.ENV.toLowerCase()} ${sshUsername}@${tmChangesServer}:${tmpFolder}"
+                                withCredentials([usernamePassword(credentialsId: flexAppCredentials, passwordVariable: 'APP_PASS', usernameVariable: 'APP_USER')]) {
+                                    tmChangesRequired = sh returnStatus: true, script: "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} /bin/bash -s - -s ${tmpFolder}/schema_version.csv.${params.ENV.toLowerCase()} -m ${tmVersionRequired} -c ${tmpFolder}/migrations -u ${APP_USER} -p ${APP_PASS} --dry-run < scripts/windchill_db.sh"
+                                }// withCredentials
+                                switch(tmChangesRequired) {
+                                    case 0:
+                                        sh "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} rm -rf ${tmpFolder}"
+                                        echo "No pending changes, temp folder: ${tmpFolder} has been deleted"
+                                        break
+                                    case 1:
+                                        sh "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} rm -rf ${tmpFolder}"
+                                        error "An error ocurred while checking the TM changes, temp folder: ${tmpFolder} has been deleted"
+                                        break
+                                    case 22:
+                                        echo 'There are pending TypeManager changes available, please review'
+                                        break
+                                    default:
+                                        sh "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} rm -rf ${tmpFolder}"
+                                        error "Unexpected exit code: ${tmChangesRequired}. Temp folder: ${tmpFolder} has been deleted"
+                                        break
+                                }// switch
+                            }// sshagent
+                        } else {
+                            tmChangesRequired = 0
+                            echo 'No pending changes, available'
+                        }// if
+                    }// ansiColor
+                }// script
+            }// steps
+            post {
+                success {
+                    echo 'Database changes checks completed successfully'
+                    deleteDir()
+                }// success
+                failure {
+                    error 'There were an error while checking the database changes'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Confirm Type Manager changes') {
+            // This stage uses 'agent none' for release the Jenkins worker while its waiting for an answer
+            agent none
+            // 22 - exit code that points to available pending changes
+            when { expression { tmChangesRequired==22 } }
+            steps {
+                script {
+                    timeout(20) {
+                        env.TM_CONFIRMED = input message: "Apply TypeManager changes for ${params.ENV} on ${tmChangesServer}.\nPlease do a review of them! (previous stage)", ok: "Yes, apply changes to ${params.ENV}!",
+                            parameters: [choice(name: 'confirmation', choices: 'NO\nNO\nNO\nyes\nNO\nNO\n', description: "Did you reviewed the TypeManager changes?")]
+                    }// timeout
+                    if (env.TM_CONFIRMED == 'yes') {
+                        tmChangesConfirmed = true
+                    } else {
+                        echo 'Aborting current deployment...'
+                        currentBuild.result = 'ABORTED'
+                        error 'Deployment aborted due to declined TypeManager changes'
+                    }// if
+                }// script
+            }// steps
+        }// stage
+
+        stage('Apply Type Manager changes') {
+            agent { label 'build&&java' }
+            when { expression { tmChangesConfirmed==true } }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        sshagent (credentials: [sshCredentials]) {
+                            // Apply changes just on the TypeManager node ${tmChangesServer}
+                            echo "Running on Flex node: ${tmChangesServer}"
+                            // transfer required files to temp folder                                
+                            withCredentials([usernamePassword(credentialsId: flexAppCredentials, passwordVariable: 'APP_PASS', usernameVariable: 'APP_USER')]) {
+                                tmChangesApplied = sh returnStatus: true, script: "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} /bin/bash -s - -s ${tmpFolder}/schema_version.csv.${params.ENV.toLowerCase()} -m ${tmVersionRequired} -c ${tmpFolder}/migrations -u ${APP_USER} -p ${APP_PASS} < scripts/windchill_db.sh"
+                            }// withCredentials
+                            switch(tmChangesApplied) {
+                                case 0:
+                                    sh "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} rm -rf ${tmpFolder}"
+                                    echo "No changes, were applied. Temp folder: ${tmpFolder} has been deleted"
+                                    error 'This message should NOT appear here !!!!. if there\'re no pending changes this stage should be skipped by default !!!'
+                                    break
+                                case 1..2:
+                                // 1 - error (some updates might be successfully applied - update schema in git), 2 - update completed successfully
+                                    // update the git with successful changes
+                                    sh "scp -C -r ${sshOpts} ${sshUsername}@${tmChangesServer}:${tmpFolder}/schema_version.csv.${params.ENV.toLowerCase()} ."
+                                    stash includes: "schema_version.csv.${params.ENV.toLowerCase()}", name: 'new_schema_version'
+                                    sshagent (credentials: [gitCredentialsID]) {
+                                        unstash 'new_schema_version'
+                                        sh 'git branch -vv'
+                                        sh "git add schema_version.csv.${params.ENV.toLowerCase()}"
+                                        def tmSchemaFileUpdated = sh returnStatus: true, script: 'git status | grep modified'
+                                        if (tmSchemaFileUpdated == 0) {
+                                            sh 'git config --global user.email "Jenkins@adidas-group.com"'
+                                            sh 'git config --global user.name "Jenkins CI"'
+                                            sh "git commit -m ${BUILD_ID}:${JOB_NAME}:${params.ENV}:${params.PROMOTED_ID}:${tmVersionRequired}:${tmChangesServer}"
+                                            sh "git push origin ${gitJenkinsBranch}"
+                                        }// if
+                                    }// sshagent
+                                    // get and archive the logs
+                                    def tmLogsArchiveExist = sh returnStatus: true, script: "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} 'stat ${tmpFolder}/type_manager_logs.tgz'"
+                                    if (tmLogsArchiveExist == 0) {
+                                        sh "scp -C -r ${sshOpts} ${sshUsername}@${tmChangesServer}:${tmpFolder}/type_manager_logs.tgz type_manager_logs_${BUILD_ID}-${tmVersionRequired}.tgz"
+                                        archiveArtifacts "type_manager_logs_${BUILD_ID}-${tmVersionRequired}.tgz"
+                                    }
+                                    if (tmChangesApplied == 1) {
+                                        error "An error ocurred while applying the TM changes. Temp folder: ${tmpFolder} was NOT deleted. Please review."
+                                    }
+                                    echo 'TypeManager changes were applied successfully'
+                                    sh "ssh ${sshOpts} -l ${sshUsername} ${tmChangesServer} rm -rf ${tmpFolder}"
+                                    break
+                                default:
+                                    error "Unexpected exit code: ${tmChangesApplied}. Temp folder: ${tmpFolder} was NOT deleted"
+                                    break
+                            }// switch
+                        }// sshagent
+                    }// ansiColor
+                }// script
+            }// steps
+            post {
+                success {
+                    echo 'Applying of TypeManager changes completed successfully'
+                    deleteDir()
+                }// success
+                failure {
+                    error 'There was a failure during applying of TypeManager changes'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Stop Flex cluster') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Flex cluster will be stopped'
+                        sshagent (credentials: [sshCredentials]) {
+                            // STOP the cluster nodes ( all except the first in list [MASTER] )
+                            def nodes = [:]
+                            for (curSshServer in sshServers) {
+                                def sshServer = curSshServer
+                                // skip master server
+                                if (sshServer == flexMasterServer) { continue }
+                                nodes["Stop ${sshServer}"] = {
+                                    echo "Running on Flex node: ${sshServer}"
+                                    echo "ssh ${sshOpts} -l ${sshUsername} ${sshServer} /bin/bash -s - stop < scripts/windchill_ctl.sh"
+                                }// nodes
+                            }// for
+                            parallel nodes
+                            // STOP the MASTER node last
+                            echo "Running on Flex MASTER node: ${flexMasterServer}"
+                            echo "ssh ${sshOpts} -l ${sshUsername} ${flexMasterServer} /bin/bash -s - stop < scripts/windchill_ctl.sh"
+                        }// sshagent
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    echo 'Stop of Flex cluster completed successfully'
+                }// success
+                failure {
+                    error 'There was a failure during stop of Flex cluster'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Archive logs') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Starting archiving the logs'
+                        sshagent (credentials: [sshCredentials]) {
+                            def nodes = [:]
+                            for (curSshServer in sshServers) {
+                                def sshServer = curSshServer
+                                nodes["Archiving ${sshServer}"] = {
+                                    echo "Running on Flex node: ${sshServer}"
+                                    sh "ssh ${sshOpts} -l ${sshUsername} ${sshServer} /bin/bash < scripts/windchill_logs.sh"
+                                }// nodes
+                            }// for
+                            parallel nodes
+                        }// sshagent
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    echo 'Archiving the logs completed successfully'
+                    // deleteDir()
+                }// success
+                failure {
+                    error 'There was a failure during log files archivation'
+               }// failure
+            }// post
+        }// stage
+
+        stage('Deploy Flex application') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Flex will be deployed'
+                        unstash 'application'
+                        def nodes = [:]
+                        for (curSshServer in sshServers) {
+                            def sshServer = curSshServer
+                            nodes["Deploy ${sshServer}"] = {
+                                sshagent (credentials: [sshCredentials]) {
+                                    echo "Running on Flex node: ${sshServer}"
+                                    sh "scp ${sshOpts} ${flexAppNamePrefix}${PROMOTED_ID}.jar ${sshUsername}@${sshServer}:/tmp"
+                                    sh "ssh ${sshOpts} -l ${sshUsername} ${sshServer} /bin/bash -s - --app ${flexAppNamePrefix}${PROMOTED_ID}.jar --env ${params.ENV} < scripts/windchill_deploy.sh"
+                                }// sshagent
+                            }// nodes
+                        }// for
+                        parallel nodes
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    echo 'Deployment of Flex application completed successfully'
+                    deleteDir()
+                }// success
+                failure {
+                    error 'There was a failure during deployment of Flex application'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Start Flex cluster') {
+            agent { label 'build&&java' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Flex cluster will be started'
+                        def sslOpts = 'SSL'
+                        if (flexAppProtocol == 'http') { sslOpts = '' }
+                        sshagent (credentials: [sshCredentials]) {
+                            // START the MASTER node first
+                            echo "Running on Flex MASTER node: ${flexMasterServer}"
+                            echo "ssh ${sshOpts} -l ${sshUsername} ${flexMasterServer} /bin/bash -s - start${sslOpts} < scripts/windchill_ctl.sh"                        
+                            // START the cluster nodes ( all except the first in list [MASTER] )
+                            def nodes = [:]
+                            for (curSshServer in sshServers) {
+                                def sshServer = curSshServer
+                                // skip master server
+                                if (sshServer == flexMasterServer) { continue }
+                                nodes["Start ${sshServer}"] = {
+                                    echo "Running on Flex node: ${sshServer}"
+                                    echo "ssh ${sshOpts} -l ${sshUsername} ${sshServer} /bin/bash -s - start${sslOpts} < scripts/windchill_ctl.sh"
+                                }// nodes
+                            }// for
+                            parallel nodes
+                        }// sshagent
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    echo 'Start of Flex cluster completed successfully'
+                }// success
+                failure {
+                    error 'There was a failure during start of Flex cluster'
+                }// failure
+            }// post
+        }// stage
+
+        stage('Check Flex cluster') {
+            agent { label 'deploy&&internal' }
+            steps {
+                echo "JENKINS_NODE_NAME = ${env.NODE_NAME}"
+                script {
+                    ansiColor('xterm') {
+                        echo 'Starting flex checks'
+                        def nodes = [:]
+                        for (curSshServer in sshServers) {
+                            def sshServer = curSshServer
+                            nodes["Check ${sshServer}"] = {
+                                sshagent (credentials: [sshCredentials]) {
+                                    echo "Running on Flex node: ${sshServer}"
+                                    sh "ssh ${sshOpts} -l ${sshUsername} ${sshServer} /bin/bash -s - status < scripts/windchill_ctl.sh"
+                                }// sshagent
+                                withCredentials([usernameColonPassword(credentialsId: flexAppCredentials, variable: 'CREDENTIALS')]) {
+                                    retry(3) {
+                                        sh "curl -I -k -s -f -u ${CREDENTIALS} ${flexAppProtocol}://${sshServer}/Windchill/rfa/jsp/main/Main.jsp"
+                                        sh "curl -k -s -f -u ${CREDENTIALS} ${flexAppProtocol}://${sshServer}/Windchill/wtcore/test/dynAnon.jsp | grep SUCCESS"
+                                    }// retry
+                                }// withCredentials
+                            }//nodes
+                        }// for
+                        parallel nodes
+                        // Check LoadBalancer
+                        withCredentials([usernameColonPassword(credentialsId: flexAppCredentials, variable: 'CREDENTIALS')]) {
+                            retry(3) {
+                                sh "curl -I -k -s -f -u ${CREDENTIALS} ${flexAppProtocol}://${flexAppLoadBalancer}/Windchill/rfa/jsp/main/Main.jsp"
+                                sh "curl -k -s -f -u ${CREDENTIALS} ${flexAppProtocol}://${flexAppLoadBalancer}/Windchill/wtcore/test/dynAnon.jsp | grep SUCCESS"
+                            }// retry
+                        }// withCredentials
+                    }// ansiColor
+                }// script
+            }// steps
+            post { 
+                success {
+                    echo 'Check of Flex cluster completed successfully'
+                }// success
+                failure {
+                    error 'There was a failure during check of Flex cluster'
+                }// failure
+            }// post
+        }// stage
+    }// stages
+}// pipeline
+
