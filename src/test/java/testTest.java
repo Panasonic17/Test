@@ -8,9 +8,6 @@ public class testTest {
 
     @Test
     public void test_method_1() {
-        ForTest ft=new ForTest();
-        Object object=ft.get();
-        assertNotNull(object);
     }
 
 }
